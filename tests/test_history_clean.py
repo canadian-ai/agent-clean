@@ -46,10 +46,17 @@ class CleanMessageTests(unittest.TestCase):
         msg = b"feat: teamwork\n\nCo-authored-by: Engineer <engineer@example.test>\n"
         self.assertEqual(module.clean_message(msg), msg)
 
+    def test_session_markers_only_preserves_other_lines_and_spacing(self):
+        before = b"fix: example\n\n\nClaude-Session: example\nCo-authored-by: Claude Code <bot@example.test>\n"
+        expected = b"fix: example\n\n\nCo-authored-by: Claude Code <bot@example.test>\n"
+        self.assertEqual(module.clean_message(before, session_markers_only=True), expected)
+
 
     def test_contributor_classification(self):
         self.assertEqual(module.contributor_category("Claude", "noreply@anthropic.com"), "ai-agent")
-        self.assertEqual(module.contributor_category("github-actions[bot]", "bot@users.noreply.github.com"), "automation")
+        self.assertEqual(module.contributor_category("github-actions[bot]", "github-actions[bot]@users.noreply.github.com"), "automation")
+        self.assertEqual(module.contributor_category("Vercel", "12345+vercel[bot]@users.noreply.github.com"), "automation")
+        self.assertEqual(module.contributor_category("Claude Vercel", "claude@example.test"), "human")
         self.assertEqual(module.contributor_category("Ola", "ola@example.test"), "human")
         self.assertEqual(module.contributor_category("tyrellshawn", "human@example.test"), "human")
 
@@ -60,7 +67,7 @@ class CleanMessageTests(unittest.TestCase):
             subprocess.run(["git", "config", "user.name", "tyrellshawn"], cwd=repo, check=True)
             subprocess.run(["git", "config", "user.email", "tyrellshawn@users.noreply.github.com"], cwd=repo, check=True)
             (repo / ".mailmap").write_text(
-                "tyrellshawn <tyrellshawn@users.noreply.github.com> Ola <ola@example.test>\\n"
+                "tyrellshawn <tyrellshawn@users.noreply.github.com> Ola <ola@example.test>\n"
             )
             subprocess.run(["git", "add", "."], cwd=repo, check=True)
             subprocess.run(["git", "commit", "-m", "first"], cwd=repo, check=True, capture_output=True)
@@ -118,6 +125,48 @@ class HistoryIntegrationTests(unittest.TestCase):
             self.assertTrue(all(a == "Original Author <human@example.test>" for a in authors.splitlines()))
             backups = self.run_git("for-each-ref", "--format=%(refname)", "refs/heads/agentclean-backup-*", cwd=src)
             self.assertTrue(backups)
+
+    def test_unlinks_bot_authorship_without_touching_human_authorship(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp)
+            self.run_git("init", "-b", "main", cwd=repo)
+            self.run_git("config", "user.name", "Kampouse", cwd=repo)
+            self.run_git("config", "user.email", "kampouse@example.test", cwd=repo)
+            self.run_git("commit", "--allow-empty", "-m", "Human commit", cwd=repo)
+            human = self.run_git("rev-parse", "HEAD", cwd=repo)
+            self.run_git("-c", "user.name=Vercel", "-c", "user.email=123+vercel[bot]@users.noreply.github.com",
+                         "commit", "--allow-empty", "-m", "Deployment", "-m",
+                         "Co-authored-by: Kampouse <kampouse@example.test>", cwd=repo)
+            old = module.summarize(repo, "main")
+            self.run_git("checkout", "--detach", cwd=repo)
+            module.rewrite(str(repo), "main", push=True, unlink_automation=True)
+            new = module.summarize(repo, "main")
+            self.assertEqual(old["tree"], new["tree"])
+            self.assertEqual(old["commits"], new["commits"])
+            self.assertEqual(human, self.run_git("rev-parse", "main^", cwd=repo))
+            self.assertEqual(self.run_git("log", "-1", "--format=%an <%ae>", "main", cwd=repo),
+                             "Repository Automation <automation@repository.invalid>")
+            self.assertIn("Co-authored-by: Kampouse", self.run_git("log", "-1", "--format=%B", "main", cwd=repo))
+
+    def test_session_cleanup_keeps_backup_local(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            repo = Path(tmp) / "repo"
+            bundle = Path(tmp) / "backup.bundle"
+            self.run_git("init", "-b", "main", str(repo))
+            self.run_git("config", "user.name", "Human", cwd=repo)
+            self.run_git("config", "user.email", "human@example.test", cwd=repo)
+            self.run_git("commit", "--allow-empty", "-m", "Subject", "-m", "Claude-Session: example",
+                         "-m", "Co-authored-by: Claude Code <bot@example.test>", cwd=repo)
+            old = self.run_git("rev-parse", "HEAD", cwd=repo)
+            self.run_git("checkout", "--detach", cwd=repo)
+            with self.assertRaisesRegex(RuntimeError, "--backup-file"):
+                module.rewrite(str(repo), "main", push=True, session_markers_only=True)
+            module.rewrite(str(repo), "main", push=True, session_markers_only=True, backup_file=bundle)
+            self.assertTrue(self.run_git("bundle", "list-heads", str(bundle), cwd=repo).startswith(old))
+            self.assertEqual(self.run_git("branch", "--list", "agentclean-backup-*", cwd=repo), "")
+            message = self.run_git("log", "-1", "--format=%B", "main", cwd=repo)
+            self.assertNotIn("Claude-Session:", message)
+            self.assertIn("Co-authored-by: Claude Code", message)
 
 
 if __name__ == "__main__":
